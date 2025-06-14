@@ -1,6 +1,157 @@
+'use client';
+
+import { useEffect, useState, useRef } from 'react';
+import io from 'socket.io-client';
 import Image from "next/image";
 
 export default function Home() {
+  const [isRecording, setIsRecording] = useState(false);
+  const [isConnected, setIsConnected] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedDevice, setSelectedDevice] = useState<string>('');
+  const [isInitializing, setIsInitializing] = useState(false);
+  const [isSending, setIsSending] = useState(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const socketRef = useRef<any>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+
+  useEffect(() => {
+    socketRef.current = io();
+
+    socketRef.current.on('connect', () => {
+      console.log('Connected to server');
+      setIsConnected(true);
+      setError(null);
+    });
+
+    socketRef.current.on('disconnect', () => {
+      console.log('Disconnected from server');
+      setIsConnected(false);
+    });
+
+    socketRef.current.on('audio-response', (audioData: Blob) => {
+      const audioBlob = new Blob([audioData], { type: 'audio/webm;codecs=opus' });
+      const audioUrl = URL.createObjectURL(audioBlob);
+      const audio = new Audio(audioUrl);
+      audio.play();
+    });
+
+    const getAudioDevices = async () => {
+      try {
+        await navigator.mediaDevices.getUserMedia({ audio: true });
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        const audioInputs = devices.filter(device => device.kind === 'audioinput');
+        setAudioDevices(audioInputs);
+        if (audioInputs.length > 0) {
+          setSelectedDevice(audioInputs[0].deviceId);
+        }
+      } catch (err) {
+        console.error('Error getting audio devices:', err);
+        setError('Please allow microphone access to continue');
+      }
+    };
+
+    getAudioDevices();
+
+    return () => {
+      if (socketRef.current) {
+        socketRef.current.disconnect();
+      }
+    };
+  }, []);
+
+  const checkDeviceAvailability = async (deviceId: string): Promise<boolean> => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { deviceId: { exact: deviceId } }
+      });
+      stream.getTracks().forEach(track => track.stop());
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const initializeAudio = async () => {
+    try {
+      setIsInitializing(true);
+      
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      if (selectedDevice && !(await checkDeviceAvailability(selectedDevice))) {
+        throw new Error('Selected device is not available');
+      }
+
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        audio: selectedDevice ? { deviceId: selectedDevice } : true
+      });
+
+      const mediaRecorder = new MediaRecorder(stream, {
+        mimeType: 'audio/webm;codecs=opus'
+      });
+      mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = [];
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      mediaRecorder.onerror = (event) => {
+        console.error('MediaRecorder error:', event);
+        setError('Error recording audio. Please try again.');
+        stopRecording();
+      };
+
+      mediaRecorder.start(100);
+      setIsRecording(true);
+      return true;
+    } catch (error: any) {
+      console.error('Error accessing microphone:', error);
+      return false;
+    } finally {
+      setIsInitializing(false);
+    }
+  };
+
+  const startRecording = async () => {
+    if (isInitializing) return;
+    setError(null);
+    await initializeAudio();
+  };
+
+  const stopRecording = async () => {
+    if (mediaRecorderRef.current && isRecording) {
+      try {
+        setIsSending(true);
+        
+        // Stop recording
+        mediaRecorderRef.current.stop();
+        mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
+        setIsRecording(false);
+
+        // Wait for the last chunk to be processed
+        await new Promise(resolve => setTimeout(resolve, 200));
+
+        // Combine all audio chunks into one blob
+        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm;codecs=opus' });
+        
+        // Send the complete audio to server
+        socketRef.current.emit('audio-stream', audioBlob);
+        
+        // Clear the chunks
+        audioChunksRef.current = [];
+      } catch (error) {
+        console.error('Error sending audio:', error);
+        setError('Error sending audio to server');
+      } finally {
+        setIsSending(false);
+      }
+    }
+  };
+
   return (
     <div className="grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20 font-[family-name:var(--font-geist-sans)]">
       <main className="flex flex-col gap-[32px] row-start-2 items-center sm:items-start">
@@ -49,6 +200,47 @@ export default function Home() {
           >
             Read our docs
           </a>
+        </div>
+
+        <div className="flex flex-col items-center gap-4">
+          <div className="text-lg">
+            Connection Status: {isConnected ? 'Connected' : 'Disconnected'}
+          </div>
+          
+          {audioDevices.length > 0 && (
+            <select
+              value={selectedDevice}
+              onChange={(e) => setSelectedDevice(e.target.value)}
+              className="mb-4 p-2 border rounded"
+              disabled={isRecording || isInitializing}
+            >
+              {audioDevices.map((device) => (
+                <option key={device.deviceId} value={device.deviceId}>
+                  {device.label || `Microphone ${device.deviceId.slice(0, 5)}`}
+                </option>
+              ))}
+            </select>
+          )}
+          
+          {error && (
+            <div className="text-red-500 mb-4 text-center">
+              {error}
+            </div>
+          )}
+          
+          <button
+            onClick={isRecording ? stopRecording : startRecording}
+            disabled={isInitializing || isSending}
+            className={`px-4 py-2 rounded-lg ${
+              isRecording
+                ? 'bg-red-500 hover:bg-red-600'
+                : 'bg-blue-500 hover:bg-blue-600'
+            } text-white transition-colors disabled:opacity-50 disabled:cursor-not-allowed`}
+          >
+            {isInitializing ? 'Initializing...' : 
+             isSending ? 'Sending...' :
+             isRecording ? 'Stop Recording' : 'Start Recording'}
+          </button>
         </div>
       </main>
       <footer className="row-start-3 flex gap-[24px] flex-wrap items-center justify-center">
