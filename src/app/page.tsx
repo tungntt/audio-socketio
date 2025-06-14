@@ -12,30 +12,50 @@ export default function Home() {
   const [selectedDevice, setSelectedDevice] = useState<string>('');
   const [isInitializing, setIsInitializing] = useState(false);
   const [isSending, setIsSending] = useState(false);
+  const [socketEndpoint, setSocketEndpoint] = useState<string>('http://localhost:3000');
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const socketRef = useRef<any>(null);
   const audioChunksRef = useRef<Blob[]>([]);
 
+  const initializeSocket = () => {
+    if (socketRef.current) {
+      socketRef.current.disconnect();
+    }
+
+    try {
+      socketRef.current = io(socketEndpoint);
+
+      socketRef.current.on('connect', () => {
+        console.log('Connected to server');
+        setIsConnected(true);
+        setError(null);
+      });
+
+      socketRef.current.on('disconnect', () => {
+        console.log('Disconnected from server');
+        setIsConnected(false);
+      });
+
+      socketRef.current.on('audio-response', (audioData: Blob) => {
+        const audioBlob = new Blob([audioData], { type: 'audio/webm;codecs=opus' });
+        const audioUrl = URL.createObjectURL(audioBlob);
+        const audio = new Audio(audioUrl);
+        audio.play();
+      });
+
+      socketRef.current.on('connect_error', (err: Error) => {
+        console.error('Socket connection error:', err);
+        setError('Failed to connect to server. Please check the endpoint.');
+        setIsConnected(false);
+      });
+    } catch (err) {
+      console.error('Error initializing socket:', err);
+      setError('Failed to initialize connection');
+    }
+  };
+
   useEffect(() => {
-    socketRef.current = io();
-
-    socketRef.current.on('connect', () => {
-      console.log('Connected to server');
-      setIsConnected(true);
-      setError(null);
-    });
-
-    socketRef.current.on('disconnect', () => {
-      console.log('Disconnected from server');
-      setIsConnected(false);
-    });
-
-    socketRef.current.on('audio-response', (audioData: Blob) => {
-      const audioBlob = new Blob([audioData], { type: 'audio/webm;codecs=opus' });
-      const audioUrl = URL.createObjectURL(audioBlob);
-      const audio = new Audio(audioUrl);
-      audio.play();
-    });
+    initializeSocket();
 
     const getAudioDevices = async () => {
       try {
@@ -59,7 +79,7 @@ export default function Home() {
         socketRef.current.disconnect();
       }
     };
-  }, []);
+  }, [socketEndpoint]);
 
   const checkDeviceAvailability = async (deviceId: string): Promise<boolean> => {
     try {
@@ -127,21 +147,16 @@ export default function Home() {
       try {
         setIsSending(true);
         
-        // Stop recording
         mediaRecorderRef.current.stop();
         mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
         setIsRecording(false);
 
-        // Wait for the last chunk to be processed
         await new Promise(resolve => setTimeout(resolve, 200));
 
-        // Combine all audio chunks into one blob
         const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm;codecs=opus' });
         
-        // Send the complete audio to server
         socketRef.current.emit('audio-stream', audioBlob);
         
-        // Clear the chunks
         audioChunksRef.current = [];
       } catch (error) {
         console.error('Error sending audio:', error);
@@ -150,6 +165,10 @@ export default function Home() {
         setIsSending(false);
       }
     }
+  };
+
+  const handleEndpointChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setSocketEndpoint(e.target.value);
   };
 
   return (
@@ -203,6 +222,28 @@ export default function Home() {
         </div>
 
         <div className="flex flex-col items-center gap-4">
+          <div className="w-full max-w-md mb-4">
+            <label htmlFor="endpoint" className="block text-sm font-medium mb-2">
+              Socket.IO Endpoint
+            </label>
+            <div className="flex gap-2">
+              <input
+                id="endpoint"
+                type="text"
+                value={socketEndpoint}
+                onChange={handleEndpointChange}
+                className="flex-1 p-2 border rounded"
+                placeholder="http://localhost:3000"
+              />
+              <button
+                onClick={initializeSocket}
+                className="px-4 py-2 bg-gray-500 hover:bg-gray-600 text-white rounded"
+              >
+                Connect
+              </button>
+            </div>
+          </div>
+
           <div className="text-lg">
             Connection Status: {isConnected ? 'Connected' : 'Disconnected'}
           </div>
@@ -230,7 +271,7 @@ export default function Home() {
           
           <button
             onClick={isRecording ? stopRecording : startRecording}
-            disabled={isInitializing || isSending}
+            disabled={isInitializing || isSending || !isConnected}
             className={`px-4 py-2 rounded-lg ${
               isRecording
                 ? 'bg-red-500 hover:bg-red-600'
